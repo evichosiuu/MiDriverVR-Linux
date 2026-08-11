@@ -37,7 +37,7 @@ Deberías tener dentro las carpetas `headers`, `lib`, `bin`, `src`, etc.
 
 **Propiedades del proyecto → C/C++ → General → Directorios de inclusión adicionales**
 
-C:\Users<tu_usuario>\Desktop\cosas\openvr-2.12.14\headers;%(AdditionalIncludeDirectories)
+C:\Users<tu_usuario>\tudireciondelarchivo\openvr-2.12.14\headers;%(AdditionalIncludeDirectories)
 
 
 ### 3. Directorios de bibliotecas (Library)
