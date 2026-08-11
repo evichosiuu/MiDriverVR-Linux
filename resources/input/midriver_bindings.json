@@ -1,0 +1,24 @@
+{
+    "name": "MediaPipe Hades Bindings",
+    "controller_type": "midriver_controller",
+    "bindings": {
+        "/actions/main": {
+            "sources": [
+                {
+                    "mode": "button",
+                    "path": "/user/hand/left/input/trigger",
+                    "inputs": {
+                        "click": { "output": "/actions/main/in/trigger" }
+                    }
+                },
+                {
+                    "mode": "button",
+                    "path": "/user/hand/right/input/trigger",
+                    "inputs": {
+                        "click": { "output": "/actions/main/in/trigger" }
+                    }
+                }
+            ]
+        }
+    }
+}

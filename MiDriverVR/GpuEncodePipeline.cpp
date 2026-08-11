@@ -1,0 +1,569 @@
+#include "GpuEncodePipeline.h"
+#include <mfreadwrite.h>
+#include <cstdio>
+#include <cstdarg>
+#include <windows.h>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+
+// Reusa el mismo estilo de log que el resto del driver, para que
+// salga junto con el resto en DebugView.
+static void GpuLog(const char* fmt, ...) {
+    char buf[320]; va_list va; va_start(va, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, va); va_end(va);
+    OutputDebugStringA("[CamVR][GPU] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
+}
+
+// ==================================================================
+//  GpuCapabilities
+// ==================================================================
+std::vector<GpuAdapterInfo> GpuCapabilities::EnumerateAllAdapters() {
+    std::vector<GpuAdapterInfo> result;
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return result;
+
+    for (UINT i = 0;; ++i) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc))) continue;
+
+        GpuAdapterInfo info;
+        info.description = desc.Description;
+        info.vendorId = desc.VendorId;
+        info.deviceId = desc.DeviceId;
+        info.dedicatedVideoMemory = desc.DedicatedVideoMemory;
+        info.isSoftware = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        info.adapter = adapter;
+        result.push_back(std::move(info));
+    }
+    return result;
+}
+
+bool GpuCapabilities::DetectBestDedicatedAdapter(GpuAdapterInfo& out) {
+    auto all = EnumerateAllAdapters();
+
+    GpuLog("Adaptadores DXGI encontrados: %zu", all.size());
+    for (auto& a : all) {
+        char narrow[256]; wcstombs_s(nullptr, narrow, sizeof(narrow), a.description.c_str(), _TRUNCATE);
+        GpuLog("  - \"%s\" vendor=0x%04X dedVRAM=%.0fMB software=%d",
+            narrow, a.vendorId, a.dedicatedVideoMemory / (1024.0 * 1024.0), (int)a.isSoftware);
+    }
+
+    const GpuAdapterInfo* best = nullptr;
+    for (auto& a : all) {
+        if (a.isSoftware) continue;                       // descarta WARP marcado explicitamente
+        if (a.vendorId == VENDOR_ID_MS_WARP) continue;     // descarta WARP por vendor id
+        if (a.dedicatedVideoMemory < MIN_DEDICATED_VRAM_BYTES) continue; // descarta iGPU / placeholders
+
+        if (!best || a.dedicatedVideoMemory > best->dedicatedVideoMemory) {
+            best = &a;
+        }
+    }
+
+    if (!best) {
+        GpuLog("No se encontro GPU dedicada real (>= %.0fMB VRAM, no WARP). Se usara perfil SOFTWARE.",
+            MIN_DEDICATED_VRAM_BYTES / (1024.0 * 1024.0));
+        return false;
+    }
+
+    out = *best;
+    char narrow[256]; wcstombs_s(nullptr, narrow, sizeof(narrow), out.description.c_str(), _TRUNCATE);
+    GpuLog("GPU dedicada elegida: \"%s\" (%.0fMB VRAM dedicada)",
+        narrow, out.dedicatedVideoMemory / (1024.0 * 1024.0));
+    return true;
+}
+
+// ==================================================================
+//  MftDriver — abstrae MFT sincrono vs asincrono
+// ==================================================================
+bool MftDriver::Attach(IMFTransform* enc) {
+    m_enc = enc;
+    m_isAsync = false;
+    m_events.Reset();
+    m_pendingNeedInput = 0;
+    m_pendingHaveOutput = 0;
+
+    ComPtr<IMFAttributes> attrs;
+    if (SUCCEEDED(enc->GetAttributes(&attrs))) {
+        UINT32 isAsync = 0;
+        attrs->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
+        if (isAsync) {
+            // Los MFT asincronos exigen desbloqueo explicito antes de
+            // poder usarse; si no, ProcessMessage/ProcessInput fallan
+            // con MF_E_TRANSFORM_ASYNC_LOCKED.
+            HRESULT hr = attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            if (FAILED(hr)) {
+                GpuLog("MftDriver: SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK) fallo 0x%08X", (unsigned)hr);
+                return false;
+            }
+            hr = enc->QueryInterface(IID_PPV_ARGS(&m_events));
+            if (FAILED(hr)) {
+                GpuLog("MftDriver: QueryInterface(IMFMediaEventGenerator) fallo 0x%08X pese a MF_TRANSFORM_ASYNC=1", (unsigned)hr);
+                return false;
+            }
+            m_isAsync = true;
+        }
+    }
+    return true;
+}
+
+void MftDriver::Detach() {
+    m_enc = nullptr;
+    m_events.Reset();
+    m_isAsync = false;
+}
+
+void MftDriver::DrainEventsNonBlocking() {
+    if (!m_isAsync || !m_events) return;
+    for (;;) {
+        ComPtr<IMFMediaEvent> ev;
+        // MF_EVENT_FLAG_NO_WAIT: no bloquea si no hay eventos en cola.
+        HRESULT hr = m_events->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
+        if (hr == E_UNEXPECTED || FAILED(hr)) break; // cola vacia u otro error -> salir
+        MediaEventType met = MEUnknown;
+        ev->GetType(&met);
+        if (met == METransformNeedInput) {
+            m_pendingNeedInput++;
+        }
+        else if (met == METransformHaveOutput) {
+            m_pendingHaveOutput++;
+        }
+        // METransformDrainComplete / METransformMarker se ignoran aqui
+        // a proposito: no los necesitamos para el bucle de streaming.
+    }
+}
+
+bool MftDriver::ReadyForInput() {
+    if (!m_isAsync) return true; // sincrono: siempre se puede intentar
+    DrainEventsNonBlocking();
+    return m_pendingNeedInput > 0;
+}
+
+HRESULT MftDriver::SubmitInput(IMFSample* sample) {
+    if (!m_enc) return E_POINTER;
+    HRESULT hr = m_enc->ProcessInput(0, sample, 0);
+    if (m_isAsync && SUCCEEDED(hr)) {
+        // Consumimos un "need input" pendiente por cada input enviado
+        // con exito, para no reenviar sin que el MFT lo haya pedido.
+        if (m_pendingNeedInput > 0) m_pendingNeedInput--;
+    }
+    return hr;
+}
+
+HRESULT MftDriver::TryGetOutput(DWORD outStreamId, ComPtr<IMFSample>& outSample) {
+    if (!m_enc) return E_POINTER;
+
+    if (m_isAsync) {
+        DrainEventsNonBlocking();
+        if (m_pendingHaveOutput <= 0) {
+            return MF_E_TRANSFORM_NEED_MORE_INPUT; // nada listo todavia, no llamar ProcessOutput
+        }
+    }
+
+    MFT_OUTPUT_STREAM_INFO si = {};
+    m_enc->GetOutputStreamInfo(outStreamId, &si);
+    MFT_OUTPUT_DATA_BUFFER ob = {};
+    bool needAlloc = !(si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES));
+    ComPtr<IMFSample> outSmp;
+    if (needAlloc) {
+        ComPtr<IMFMediaBuffer> outBuf;
+        MFCreateMemoryBuffer(si.cbSize > 0 ? si.cbSize : 512 * 1024, &outBuf);
+        MFCreateSample(&outSmp);
+        outSmp->AddBuffer(outBuf.Get());
+        ob.pSample = outSmp.Get();
+    }
+
+    DWORD status = 0;
+    HRESULT hr = m_enc->ProcessOutput(0, 1, &ob, &status);
+
+    if (m_isAsync && hr != MF_E_TRANSFORM_NEED_MORE_INPUT) {
+        if (m_pendingHaveOutput > 0) m_pendingHaveOutput--;
+    }
+
+    if (FAILED(hr)) {
+        if (ob.pSample && ob.pSample != outSmp.Get()) ob.pSample->Release();
+        return hr;
+    }
+    if (!ob.pSample) return MF_E_TRANSFORM_NEED_MORE_INPUT;
+
+    if (needAlloc) {
+        outSample = outSmp;
+    }
+    else {
+        outSample.Attach(ob.pSample); // el MFT lo entrego el mismo (raro pero valido)
+    }
+    return S_OK;
+}
+
+// ==================================================================
+//  GpuEncodePipeline
+// ==================================================================
+bool GpuEncodePipeline::DetectAndCreateDevice() {
+    bool hasDedicated = GpuCapabilities::DetectBestDedicatedAdapter(m_adapterInfo);
+
+    D3D_FEATURE_LEVEL fl[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    D3D_FEATURE_LEVEL flOut{};
+    UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#if defined(_DEBUG)
+    // flags |= D3D11_CREATE_DEVICE_DEBUG; // activar manualmente si hace falta
+#endif
+
+    HRESULT hr;
+    if (hasDedicated) {
+        hr = D3D11CreateDevice(m_adapterInfo.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+            flags, fl, ARRAYSIZE(fl), D3D11_SDK_VERSION, &m_device, &flOut, &m_context);
+    }
+    else {
+        // Sin GPU dedicada: se deja que D3D11 elija (normalmente la
+        // iGPU). El watchdog HW->SW existente sigue siendo la red de
+        // seguridad si ni siquiera esto entrega NALs.
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            flags, fl, ARRAYSIZE(fl), D3D11_SDK_VERSION, &m_device, &flOut, &m_context);
+    }
+    if (FAILED(hr)) {
+        GpuLog("D3D11CreateDevice FAILED 0x%08X - no se podra usar encoder de HARDWARE con D3D manager", (unsigned)hr);
+        return false;
+    }
+
+    // Necesario porque el device se comparte entre el hilo de captura
+    // y el MFT (que internamente puede usar sus propios hilos).
+    ComPtr<ID3D10Multithread> mt;
+    if (SUCCEEDED(m_device.As(&mt))) mt->SetMultithreadProtected(TRUE);
+
+    hr = MFCreateDXGIDeviceManager(&m_dxgiResetToken, &m_dxgiMgr);
+    if (FAILED(hr)) {
+        GpuLog("MFCreateDXGIDeviceManager FAILED 0x%08X", (unsigned)hr);
+        return false;
+    }
+    hr = m_dxgiMgr->ResetDevice(m_device.Get(), m_dxgiResetToken);
+    if (FAILED(hr)) {
+        GpuLog("IMFDXGIDeviceManager::ResetDevice FAILED 0x%08X", (unsigned)hr);
+        return false;
+    }
+
+    // ── Perfil dinamico ──
+    // El cuello de botella deja de ser la CPU solo cuando el encoder
+    // corre de verdad en la GPU dedicada; por eso el profile "grande"
+    // solo se activa si hasDedicated es true, NO solo por haber
+    // creado un ID3D11Device (que puede caer en la iGPU igual).
+    if (hasDedicated) {
+        m_profile = { 1920, 1080, 60, 12000000, true };
+        GpuLog("Perfil de encoding: 1080p60 @ 12Mbps (GPU dedicada confirmada)");
+    }
+    else {
+        m_profile = { 1280, 720, 30, 6000000, false };
+        GpuLog("Perfil de encoding: 720p30 @ 6Mbps (sin GPU dedicada confirmada)");
+    }
+    return true;
+}
+
+bool GpuEncodePipeline::CreateTexturePool(uint32_t poolSize) {
+    if (!m_device) return false;
+    poolSize = (poolSize < 2) ? 2 : (poolSize > MAX_TEX_POOL ? MAX_TEX_POOL : poolSize);
+    m_poolSize = poolSize;
+    m_writeCursor = 0;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = m_profile.width;
+    td.Height = m_profile.height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // compatible con desktop duplication / GDI blit
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = 0;
+    td.MiscFlags = 0;
+
+    for (uint32_t i = 0; i < poolSize; ++i) {
+        HRESULT hr = m_device->CreateTexture2D(&td, nullptr, &m_texPool[i]);
+        if (FAILED(hr)) {
+            GpuLog("CreateTexture2D pool[%u] FAILED 0x%08X", i, (unsigned)hr);
+            return false;
+        }
+        m_inFlight[i] = false;
+    }
+    GpuLog("Pool de %u texturas creado (%ux%u, cero-copia a encoder)", poolSize, td.Width, td.Height);
+    return true;
+}
+
+ID3D11Texture2D* GpuEncodePipeline::AcquireWriteTexture(uint32_t& outIndex) {
+    if (m_poolSize == 0) { outIndex = 0; return nullptr; }
+    uint32_t idx = m_writeCursor;
+    m_writeCursor = (m_writeCursor + 1) % m_poolSize;
+
+    if (m_inFlight[idx].load()) {
+        // La textura "siguiente" en el anillo todavia esta en manos
+        // del encoder. En vez de bloquear la captura (que es lo que
+        // realmente se nota como input lag), se avisa por log y se
+        // reutiliza igual: el peor caso es un frame duplicado, no un
+        // frame de retraso acumulado.
+        static ULONGLONG s_lastWarnMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - s_lastWarnMs > 2000) {
+            GpuLog("Pool de texturas saturado (idx=%u aun en-vuelo): el encoder va mas lento que la captura", idx);
+            s_lastWarnMs = now;
+        }
+    }
+    outIndex = idx;
+    return m_texPool[idx].Get();
+}
+
+ComPtr<IMFSample> GpuEncodePipeline::WrapTextureAsSample(uint32_t index, LONGLONG pts, LONGLONG dur) {
+    ComPtr<IMFSample> sample;
+    if (index >= m_poolSize || !m_texPool[index]) return sample;
+
+    ComPtr<IMFMediaBuffer> buf;
+    // Subresource 0: el pool no usa arrays ni mips, siempre 0.
+    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), m_texPool[index].Get(), 0, FALSE, &buf);
+    if (FAILED(hr)) {
+        GpuLog("MFCreateDXGISurfaceBuffer FAILED 0x%08X (index=%u)", (unsigned)hr, index);
+        return sample;
+    }
+    DWORD len = m_profile.width * m_profile.height * 4;
+    buf->SetCurrentLength(len);
+
+    MFCreateSample(&sample);
+    sample->AddBuffer(buf.Get());
+    sample->SetSampleTime(pts);
+    sample->SetSampleDuration(dur);
+    return sample;
+}
+
+void GpuEncodePipeline::ApplyLowLatencyCodecSettings(IMFTransform* enc, uint32_t bitrate, uint32_t gop) {
+    ComPtr<ICodecAPI> codec;
+    if (FAILED(enc->QueryInterface(IID_PPV_ARGS(&codec)))) {
+        GpuLog("ApplyLowLatencyCodecSettings: este MFT no expone ICodecAPI, se omiten ajustes finos");
+        return;
+    }
+    VARIANT v;
+
+    // ── Rate control: VBR acotado en vez de CBR puro ──
+    // Con CBR fijo el encoder reparte el mismo bitrate a cuadros
+    // quietos que a cuadros con mucho movimiento; en movimiento
+    // rapido necesita mas bits para no perder detalle y, al no
+    // tenerlos, comprime de mas (blur/bloques). Con VBR acotado el
+    // bitrate promedio sigue respetado pero se deja "explotar" hasta
+    // ~1.5x en los frames de movimiento.
+    const char* rcModeUsed = "UnconstrainedVBR";
+    VariantInit(&v); v.vt = VT_UI4;
+    v.ulVal = eAVEncCommonRateControlMode_UnconstrainedVBR;
+    HRESULT hrRc = codec->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+    if (FAILED(hrRc)) {
+        // Algunos MFT (sobre todo software) no soportan VBR sin constraint;
+        // fallback seguro a Quality VBR, y si tampoco, a CBR como antes.
+        VariantInit(&v); v.vt = VT_UI4; v.ulVal = eAVEncCommonRateControlMode_Quality;
+        if (SUCCEEDED(codec->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v))) {
+            rcModeUsed = "Quality-VBR (fallback)";
+        }
+        else {
+            VariantInit(&v); v.vt = VT_UI4; v.ulVal = eAVEncCommonRateControlMode_CBR;
+            codec->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
+            rcModeUsed = "CBR (fallback final)";
+        }
+    }
+
+    VariantInit(&v); v.vt = VT_UI4; v.ulVal = (uint32_t)(bitrate * 1.5); // tope de pico
+    codec->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v);
+
+    VariantInit(&v); v.vt = VT_UI4; v.ulVal = bitrate;
+    codec->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
+
+    VariantInit(&v); v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
+    codec->SetValue(&CODECAPI_AVEncCommonLowLatency, &v);
+    codec->SetValue(&CODECAPI_AVEncCommonRealTime, &v);
+
+    // Sin B-frames: solo anaden latencia de reordenado sin beneficio
+    // en streaming en vivo sin buffer de reproduccion.
+    VariantInit(&v); v.vt = VT_UI4; v.ulVal = 0;
+    codec->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
+
+    VariantInit(&v); v.vt = VT_UI4; v.ulVal = gop;
+    codec->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
+
+    // 2 frames de referencia (antes 1): amplia un poco la ventana de
+    // motion estimation, lo que ayuda notablemente a la nitidez en
+    // movimiento con un impacto minimo en latencia.
+    VariantInit(&v); v.vt = VT_UI4; v.ulVal = 2;
+    codec->SetValue(&CODECAPI_AVEncVideoMaxNumRefFrame, &v);
+
+    // Deshabilitar explicitamente el modo de calidad "2-pass"/VBR con
+    // lookahead si el driver lo soporta (algunos MFT de NVENC/QSV
+    // exponen esto bajo AVEncCommonQualityVsSpeed; forzar al extremo
+    // de "velocidad" en vez de "calidad" reduce buffering interno).
+    VariantInit(&v); v.vt = VT_UI4; v.ulVal = 0; // 0 = maxima velocidad en la escala tipica 0-100
+    codec->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &v);
+
+    VariantInit(&v); v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
+    codec->SetValue(&CODECAPI_AVEncH264CABACEnable, &v);
+
+    GpuLog("Ajustes de baja latencia aplicados: rateControl=%s %ukbps (pico %ukbps), GOP=%u, refFrames=2, sin B-frames",
+        rcModeUsed, bitrate / 1000, (uint32_t)(bitrate * 1.5) / 1000, gop);
+}
+
+bool GpuEncodePipeline::SmokeTestEncoder(IMFTransform* enc, MftDriver& driver, DWORD inSt, DWORD outSt) {
+    // Codifica 3 frames negros y confirma que al menos uno produce
+    // un NAL de salida. Esto es lo que distingue "el MFT acepto los
+    // tipos" de "el MFT realmente procesa muestras" — exactamente el
+    // fallo silencioso que describe el comentario original del driver.
+    const uint32_t W = m_profile.width, H = m_profile.height;
+    std::vector<uint8_t> black(W * H * 4, 0);
+
+    uint32_t idx; ID3D11Texture2D* tex = AcquireWriteTexture(idx);
+    if (!tex) return false;
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    // Las texturas del pool son DEFAULT (no mapeables directo); para
+    // el smoke test se sube via UpdateSubresource, que si funciona
+    // sobre DEFAULT.
+    m_context->UpdateSubresource(tex, 0, nullptr, black.data(), W * 4, 0);
+
+    LONGLONG dur = 10000000LL / (m_profile.fps > 0 ? m_profile.fps : 30);
+    bool gotOutput = false;
+
+    for (int frame = 0; frame < 3 && !gotOutput; ++frame) {
+        auto sample = WrapTextureAsSample(idx, (LONGLONG)frame * dur, dur);
+        if (!sample) return false;
+
+        // Para MFT asincronos hay que esperar a que pida input; se le
+        // da un margen corto porque esto es solo un smoke test.
+        ULONGLONG waitStart = GetTickCount64();
+        while (driver.IsAsync() && !driver.ReadyForInput()) {
+            if (GetTickCount64() - waitStart > 200) break;
+            Sleep(2);
+        }
+
+        HRESULT hr = driver.SubmitInput(sample.Get());
+        if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
+            GpuLog("SmokeTest: SubmitInput FAILED 0x%08X", (unsigned)hr);
+            return false;
+        }
+
+        ULONGLONG outWaitStart = GetTickCount64();
+        while (GetTickCount64() - outWaitStart < 300) {
+            ComPtr<IMFSample> outSmp;
+            HRESULT ohr = driver.TryGetOutput(outSt, outSmp);
+            if (ohr == S_OK && outSmp) { gotOutput = true; break; }
+            if (ohr != MF_E_TRANSFORM_NEED_MORE_INPUT) break;
+            Sleep(2);
+        }
+    }
+    return gotOutput;
+}
+
+bool GpuEncodePipeline::TryCandidate(IMFActivate* activate, ComPtr<IMFTransform>& outEnc,
+    MftDriver& outDriver, DWORD& inSt, DWORD& outSt) {
+    ComPtr<IMFTransform> enc;
+    HRESULT hr = activate->ActivateObject(IID_PPV_ARGS(&enc));
+    if (FAILED(hr)) { GpuLog("TryCandidate: ActivateObject FAILED 0x%08X", (unsigned)hr); return false; }
+
+    // ── Paso clave que faltaba en el codigo original: entregar el
+    // D3D Manager REAL antes de negociar tipos, no despues. ──
+    hr = enc->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)m_dxgiMgr.Get());
+    if (FAILED(hr)) {
+        // No todos los MFT de hardware lo requieren estrictamente,
+        // pero si falla aqui casi seguro tampoco procesara samples
+        // D3D reales despues, asi que se descarta el candidato.
+        GpuLog("TryCandidate: SET_D3D_MANAGER FAILED 0x%08X - candidato descartado", (unsigned)hr);
+        return false;
+    }
+
+    MftDriver driver;
+    if (!driver.Attach(enc.Get())) { GpuLog("TryCandidate: MftDriver::Attach fallo"); return false; }
+
+    IMFAttributes* attrObj = nullptr;
+    if (SUCCEEDED(enc->GetAttributes(&attrObj)) && attrObj) { attrObj->SetUINT32(MF_LOW_LATENCY, TRUE); attrObj->Release(); }
+
+    ComPtr<IMFMediaType> omt; MFCreateMediaType(&omt);
+    omt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    omt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    MFSetAttributeSize(omt.Get(), MF_MT_FRAME_SIZE, m_profile.width, m_profile.height);
+    MFSetAttributeRatio(omt.Get(), MF_MT_FRAME_RATE, m_profile.fps, 1);
+    omt->SetUINT32(MF_MT_AVG_BITRATE, m_profile.bitrate);
+    omt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    omt->SetUINT32(MF_MT_MPEG2_PROFILE, 100); // High profile: mejor calidad/bitrate en GPU dedicada
+    hr = enc->SetOutputType(0, omt.Get(), 0);
+    if (FAILED(hr)) { GpuLog("TryCandidate: SetOutputType FAILED 0x%08X", (unsigned)hr); return false; }
+
+    ComPtr<IMFMediaType> imt; MFCreateMediaType(&imt);
+    imt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    imt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12); // la mayoria de HW MFT prefieren NV12 incluso via textura
+    MFSetAttributeSize(imt.Get(), MF_MT_FRAME_SIZE, m_profile.width, m_profile.height);
+    MFSetAttributeRatio(imt.Get(), MF_MT_FRAME_RATE, m_profile.fps, 1);
+    imt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    hr = enc->SetInputType(0, imt.Get(), 0);
+    if (FAILED(hr)) { GpuLog("TryCandidate: SetInputType FAILED 0x%08X", (unsigned)hr); return false; }
+
+    ApplyLowLatencyCodecSettings(enc.Get(), m_profile.bitrate, m_profile.fps);
+
+    enc->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    enc->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    enc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    if (!SmokeTestEncoder(enc.Get(), driver, 0, 0)) {
+        GpuLog("TryCandidate: smoke test NO produjo NALs - candidato descartado (fallo silencioso tipico de HW sin D3D real)");
+        enc->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        return false;
+    }
+
+    // Reset limpio tras el smoke test para que el streaming real
+    // arranque con un IDR desde cero.
+    enc->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    enc->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    enc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    outEnc = enc;
+    outDriver = std::move(driver);
+    inSt = 0; outSt = 0;
+    return true;
+}
+
+bool GpuEncodePipeline::SelectAndInitHardwareEncoder(ComPtr<IMFTransform>& outEnc,
+    MftDriver& outDriver, DWORD& inSt, DWORD& outSt) {
+    if (!m_dxgiMgr) {
+        GpuLog("SelectAndInitHardwareEncoder: no hay IMFDXGIDeviceManager - llama DetectAndCreateDevice() primero");
+        return false;
+    }
+
+    MFT_REGISTER_TYPE_INFO ti = { MFMediaType_Video, MFVideoFormat_NV12 };
+    MFT_REGISTER_TYPE_INFO to = { MFMediaType_Video, MFVideoFormat_H264 };
+    IMFActivate** acts = nullptr; UINT32 cnt = 0;
+    MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+        &ti, &to, &acts, &cnt);
+
+    GpuLog("SelectAndInitHardwareEncoder: %u candidato(s) de HARDWARE encontrados, probando en orden de merito", cnt);
+
+    bool found = false;
+    for (UINT32 i = 0; i < cnt && !found; ++i) {
+        WCHAR name[128] = L"?";
+        UINT32 nameLen = 0;
+        acts[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, ARRAYSIZE(name), &nameLen);
+        char narrow[128]; wcstombs_s(nullptr, narrow, sizeof(narrow), name, _TRUNCATE);
+        GpuLog("  Candidato %u/%u: \"%s\"", i + 1, cnt, narrow);
+
+        if (TryCandidate(acts[i], outEnc, outDriver, inSt, outSt)) {
+            GpuLog("  -> ACEPTADO: \"%s\" confirmado produciendo NALs con D3D Manager real (%s)",
+                narrow, m_profile.dedicatedGpu ? "GPU dedicada" : "GPU no confirmada como dedicada");
+            found = true;
+        }
+    }
+
+    for (UINT32 i = 0; i < cnt; i++) acts[i]->Release();
+    if (acts) CoTaskMemFree(acts);
+
+    if (!found) {
+        GpuLog("SelectAndInitHardwareEncoder: NINGUN candidato de HARDWARE paso el smoke test - el llamador debe caer a SOFTWARE");
+    }
+    return found;
+}
+
+void GpuEncodePipeline::Shutdown() {
+    for (uint32_t i = 0; i < MAX_TEX_POOL; ++i) { m_texPool[i].Reset(); m_inFlight[i] = false; }
+    m_poolSize = 0;
+    m_dxgiMgr.Reset();
+    m_context.Reset();
+    m_device.Reset();
+}

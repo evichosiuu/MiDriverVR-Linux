@@ -1,0 +1,12 @@
+{
+  "driver_files": [
+    {
+      "resourcePaths": [
+        "resources"
+      ],
+      "inputProfilePaths": [
+        "resources/input"
+      ]
+    }
+  ]
+}
