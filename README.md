@@ -44,7 +44,7 @@ C:\Users<tu_usuario>\tudireciondelarchivo\openvr-2.12.14\headers;%(AdditionalInc
 
 **Propiedades del proyecto → Vinculador → General → Directorios de bibliotecas adicionales**
 
-C:\Users<tu_usuario>\Desktop\cosas\openvr-2.12.14\lib\win64;%(AdditionalLibraryDirectories)
+C:\Users<tu_usuario>\tudireciondelarchivo\openvr-2.12.14\lib\win64;%(AdditionalLibraryDirectories)
 
 
 > En ambos casos, deja la **Configuración** en "Todas las config." y la **Plataforma** en "Todas las plataformas" para que aplique a Debug y Release por igual.
