@@ -11,25 +11,6 @@ static void PrevLog(const char* fmt, ...) {
     OutputDebugStringA("[CamVR][LowResPreview] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
 }
 
-// ==================================================================
-//  Deteccion del monitor virtual real
-//
-//  Mismo fix que v12 en VrH264Streamer::ResolveCaptureRegion(): el
-//  monitor que el driver anuncia (WINDOW_W x WINDOW_H, ver dllmain.cpp)
-//  es una pantalla EXTENDIDA que Windows coloca donde el SO decide, no
-//  necesariamente en (0,0). Si esto se ignora, se termina capturando
-//  el monitor primario (que puede estar en negro con SteamVR activo)
-//  en vez de la imagen VR real, y el preview de la 3DS sale negro
-//  aunque el resto del pipeline funcione.
-//
-//  Se duplica aca (en vez de reusar el metodo privado de
-//  VrH264Streamer) para que VrLowResPreview no dependa de esa clase y
-//  siga funcionando aunque el stream H.264 principal este parado.
-//
-//  IMPORTANTE: estos numeros deben coincidir con CMyDisplayComponent
-//  en dllmain.cpp (WINDOW_W/WINDOW_H). Si los cambias alla, cambialos
-//  aca tambien.
-// ==================================================================
 static const uint32_t kAnnouncedWindowW = 1920;
 static const uint32_t kAnnouncedWindowH = 1080;
 
@@ -50,14 +31,14 @@ void VrLowResPreview::ResolveCaptureRegion() {
 
     const MonitorRectInfo* chosen = nullptr;
 
-    // 1) Match exacto de resolucion con el monitor virtual anunciado.
+
     for (auto& m : monitors) {
         LONG w = m.rc.right - m.rc.left, h = m.rc.bottom - m.rc.top;
         if ((UINT32)w == kAnnouncedWindowW && (UINT32)h == kAnnouncedWindowH && !m.isPrimary) {
             chosen = &m; break;
         }
     }
-    // 2) Cualquier monitor no-primario.
+
     if (!chosen) {
         for (auto& m : monitors) { if (!m.isPrimary) { chosen = &m; break; } }
     }
@@ -80,9 +61,7 @@ void VrLowResPreview::ResolveCaptureRegion() {
     }
 }
 
-// ==================================================================
-//  GDI init/cleanup
-// ==================================================================
+
 bool VrLowResPreview::InitGdi() {
     m_screenDC = GetDC(nullptr);
     if (!m_screenDC) { PrevLog("GetDC(nullptr) fallo err=%u", (unsigned)GetLastError()); return false; }
@@ -118,16 +97,7 @@ void VrLowResPreview::CleanupGdi() {
     if (m_screenDC) { ReleaseDC(nullptr, m_screenDC); m_screenDC = nullptr; }
 }
 
-// ==================================================================
-//  Captura + downscale + conversion BGRA -> RGB565
-//
-//  StretchBlt hace el downscale de la region completa (m_captureW x
-//  m_captureH) a FRAME_W x FRAME_H de una sola pasada -- mucho mas
-//  barato que capturar a resolucion completa y reescalar aparte.
-//
-//  GDI entrega BGRA (B en el byte 0), igual que en VrH264Streamer.
-//  RGB565 empaqueta: bits [15:11]=R(5), [10:5]=G(6), [4:0]=B(5).
-// ==================================================================
+
 bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     SetStretchBltMode(m_memDC, HALFTONE);
     SetBrushOrgEx(m_memDC, 0, 0, nullptr);
@@ -165,9 +135,7 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     return true;
 }
 
-// ==================================================================
-//  Red
-// ==================================================================
+
 bool VrLowResPreview::InitNetwork() {
     m_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (m_sock == INVALID_SOCKET) { PrevLog("socket() fallo err=%d", WSAGetLastError()); return false; }
@@ -189,7 +157,7 @@ void VrLowResPreview::CleanupNetwork() {
     if (m_sock != INVALID_SOCKET) { closesocket(m_sock); m_sock = INVALID_SOCKET; }
 }
 
-// ---- Suscriptores ----
+
 void VrLowResPreview::PruneSubscribers() {
     ULONGLONG now = GetTickCount64();
     std::lock_guard<std::mutex> lk(m_subsMtx);
@@ -225,7 +193,7 @@ void VrLowResPreview::ListenLoop() {
     }
 }
 
-// ---- Envio de un frame trozado a todos los suscriptores vivos ----
+
 void VrLowResPreview::SendFrameToSubscribers(const uint16_t* rgb565, uint32_t frameId) {
     std::vector<Subscriber> subsCopy;
     {
@@ -258,7 +226,7 @@ void VrLowResPreview::SendFrameToSubscribers(const uint16_t* rgb565, uint32_t fr
     }
 }
 
-// ---- Loop de captura/envio ----
+
 void VrLowResPreview::CaptureLoop() {
     if (!InitGdi()) {
         PrevLog("InitGdi fallo - preview no disponible (el resto del driver sigue funcionando igual)");
@@ -294,9 +262,7 @@ void VrLowResPreview::CaptureLoop() {
     CleanupGdi();
 }
 
-// ==================================================================
-//  API publica
-// ==================================================================
+
 bool VrLowResPreview::Start() {
     if (m_running.exchange(true)) return true;
     if (!InitNetwork()) { m_running = false; return false; }
