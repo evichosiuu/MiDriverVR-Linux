@@ -110,6 +110,7 @@ SteamVR\drivers\MiDriverVR
 | Streaming de audio | 47298 | TCP |
 
 ---
+recuerda de modificar el vrsetings para tambien activar el driver C:\Program Files (x86)\Steam\config\
 
 ### Notas técnicas
 
@@ -228,6 +229,8 @@ SteamVR\drivers\MiDriverVR
 | Audio streaming | 47298 | TCP |
 
 ---
+
+Remember to modify the VR settings to also activate the driver at C:\Program Files (x86)\Steam\config\.
 
 ### Technical notes
 
