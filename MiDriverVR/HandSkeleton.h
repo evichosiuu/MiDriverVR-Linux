@@ -2,32 +2,6 @@
 #include <openvr_driver.h>
 #include <cmath>
 
-// ==================================================================
-//  HandSkeleton.h
-//
-//  Construye los 31 VRBoneTransform_t que SteamVR espera para animar
-//  el esqueleto de "/skeleton/hand/left" o "/skeleton/hand/right" a
-//  partir de 5 valores de curl (thumb,index,middle,ring,pinky) 0..1.
-//
-//  IMPORTANTE - ESTO ES UNA APROXIMACION ANATOMICA, NO LA TABLA
-//  OFICIAL DE VALVE:
-//    Las posiciones/longitudes de cada hueso de aca son proporciones
-//    promedio de una mano humana, no los valores exactos que usa el
-//    SDK de OpenVR (esos viven en el sample driver_sample.cpp del
-//    repo ValveSoftware/openvr, que no se reprodujo textual aca).
-//    Con esto los dedos SI van a curvarse correctamente en juegos
-//    compatibles, pero la malla de la mano puede verse levemente
-//    distinta a la "oficial" (dedos un poco mas largos/cortos,
-//    ligera rotacion de muñeca). Para afinarlo:
-//      1. En SteamVR: Configuracion > Controladores > "Mostrar
-//         esqueleto de mano" (o similar segun version) para ver el
-//         esqueleto en vivo.
-//      2. Si un dedo se dobla "para el costado" en vez de hacia la
-//         palma, cambiar BEND_AXIS_X/Y/Z abajo (probar los 3 ejes).
-//      3. Si el orden de huesos no coincide con lo que muestra
-//         SteamVR (raro, pero puede pasar segun version del SDK),
-//         reordenar el enum BoneIndex.
-// ==================================================================
 
 namespace HandSkeleton {
 
