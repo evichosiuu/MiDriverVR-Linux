@@ -23,17 +23,33 @@ public:
         ss.channels = CHANNELS;
 
         int error = 0;
+        // Try desktop audio monitor first for audio loopback
         m_pa = pa_simple_new(
             nullptr,                // Use default server
             "MiDriverVR",          // Application name
             PA_STREAM_RECORD,      // Stream direction
-            nullptr,                // Default device / monitor
+            "@DEFAULT_SINK@.monitor", // Desktop audio loopback monitor
             "SteamVR Audio Stream",// Stream description
             &ss,                    // Sample spec
             nullptr,                // Channel map
             nullptr,                // Buffer attributes
             &error
         );
+
+        if (!m_pa) {
+            // Fallback to default source if monitor device is unavailable
+            m_pa = pa_simple_new(
+                nullptr,
+                "MiDriverVR",
+                PA_STREAM_RECORD,
+                nullptr,
+                "SteamVR Audio Stream",
+                &ss,
+                nullptr,
+                nullptr,
+                &error
+            );
+        }
 
         if (!m_pa) {
             DbgLog("Aviso: pa_simple_new fallo (error=%d: %s). Se usara generador de silencio para el streaming de audio.",

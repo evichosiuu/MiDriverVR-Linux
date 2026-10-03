@@ -118,7 +118,12 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     return true;
 }
 #else
+static int PrevSilentX11ErrorHandler(Display*, XErrorEvent*) {
+    return 0;
+}
+
 bool VrLowResPreview::InitGdi() {
+    XSetErrorHandler(PrevSilentX11ErrorHandler);
     m_display = XOpenDisplay(NULL);
     if (m_display) {
         m_rootWindow = DefaultRootWindow(m_display);
@@ -138,20 +143,27 @@ void VrLowResPreview::ResolveCaptureRegion() {}
 bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     outRgb565.resize((size_t)FRAME_W * FRAME_H);
     if (m_display && m_rootWindow) {
-        XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, FRAME_W, FRAME_H, AllPlanes, ZPixmap);
-        if (image) {
-            for (int y = 0; y < FRAME_H; ++y) {
-                for (int x = 0; x < FRAME_W; ++x) {
-                    unsigned long pixel = XGetPixel(image, x, y);
-                    uint8_t b = pixel & 0xFF;
-                    uint8_t g = (pixel >> 8) & 0xFF;
-                    uint8_t r = (pixel >> 16) & 0xFF;
-                    uint16_t px = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-                    outRgb565[y * FRAME_W + x] = px;
+        XWindowAttributes gattr{};
+        if (XGetWindowAttributes(m_display, m_rootWindow, &gattr) != 0) {
+            int capW = (FRAME_W < gattr.width) ? FRAME_W : gattr.width;
+            int capH = (FRAME_H < gattr.height) ? FRAME_H : gattr.height;
+            if (capW > 0 && capH > 0) {
+                XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, capW, capH, AllPlanes, ZPixmap);
+                if (image) {
+                    for (int y = 0; y < capH && y < FRAME_H; ++y) {
+                        for (int x = 0; x < capW && x < FRAME_W; ++x) {
+                            unsigned long pixel = XGetPixel(image, x, y);
+                            uint8_t b = pixel & 0xFF;
+                            uint8_t g = (pixel >> 8) & 0xFF;
+                            uint8_t r = (pixel >> 16) & 0xFF;
+                            uint16_t px = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                            outRgb565[y * FRAME_W + x] = px;
+                        }
+                    }
+                    XDestroyImage(image);
+                    return true;
                 }
             }
-            XDestroyImage(image);
-            return true;
         }
     }
 

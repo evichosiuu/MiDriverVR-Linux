@@ -680,13 +680,11 @@ class CServerDriver : public IServerTrackedDeviceProvider {
         while (m_annRunning.load()) {
             if ((cycle++ % 5) == 0) {
                 targets = GetSubnetBroadcastAddressesPort(ResolveAnnouncePort());
-                if (targets.empty()) {
-                    sockaddr_in dest{};
-                    dest.sin_family = AF_INET;
-                    dest.sin_port = htons(ResolveAnnouncePort());
-                    dest.sin_addr.s_addr = INADDR_BROADCAST;
-                    targets.push_back(dest);
-                }
+                sockaddr_in globalBcast{};
+                globalBcast.sin_family = AF_INET;
+                globalBcast.sin_port = htons(ResolveAnnouncePort());
+                globalBcast.sin_addr.s_addr = INADDR_BROADCAST;
+                targets.push_back(globalBcast);
             }
             if (ml > 0) {
                 for (auto& dest : targets) {
@@ -711,7 +709,11 @@ class CServerDriver : public IServerTrackedDeviceProvider {
         SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); if (s == INVALID_SOCKET) return s;
         SetSocketReuseAddr(s);
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = INADDR_ANY;
-        bind(s, (sockaddr*)&a, sizeof(a));
+        if (bind(s, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
+            DbgLog("MakeUDP: bind fallo puerto UDP:%u (err=%d)", port, WSAGetLastError());
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
 #ifdef _WIN32
         u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
 #else
@@ -721,9 +723,10 @@ class CServerDriver : public IServerTrackedDeviceProvider {
     }
 
     void ProcessAuth() {
+        if (m_as == INVALID_SOCKET) return;
         char buf[64]; sockaddr_in from{}; socklen_t fl = sizeof(from); int n;
         uint8_t secret[16]; LoadSecret(secret);
-        while ((n = recvfrom(m_as, buf, sizeof(buf), 0, (sockaddr*)&from, &fl)) > 0) {
+        while ((fl = sizeof(from)), (n = recvfrom(m_as, buf, sizeof(buf), 0, (sockaddr*)&from, &fl)) > 0) {
             if (n == 8 && memcmp(buf, "CVRPING?", 8) == 0) {
                 sendto(m_as, "CVRPONG!", 8, 0, (sockaddr*)&from, fl);
                 continue;
@@ -749,8 +752,9 @@ class CServerDriver : public IServerTrackedDeviceProvider {
     }
 
     void ProcessData() {
+        if (m_ds == INVALID_SOCKET) return;
         char buf[PACKET_BYTES + 16]; sockaddr_in from{}; socklen_t fl = sizeof(from); int n;
-        while ((n = recvfrom(m_ds, buf, sizeof(buf), 0, (sockaddr*)&from, &fl)) > 0) {
+        while ((fl = sizeof(from)), (n = recvfrom(m_ds, buf, sizeof(buf), 0, (sockaddr*)&from, &fl)) > 0) {
             if (n != PACKET_BYTES) continue;
             bool loop = IsLoopbackAddr(from);
             ClientSession& sess = loop ? g_kbdSession : g_phoneSession;

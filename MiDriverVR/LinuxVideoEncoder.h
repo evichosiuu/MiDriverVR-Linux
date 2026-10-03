@@ -9,6 +9,10 @@
 #include <vector>
 #include <cstdint>
 
+inline int SilentX11ErrorHandler(Display*, XErrorEvent*) {
+    return 0;
+}
+
 class LinuxVideoEncoder {
 public:
     x264_t* m_encoder = nullptr;
@@ -58,6 +62,7 @@ public:
             return false;
         }
 
+        XSetErrorHandler(SilentX11ErrorHandler);
         m_display = XOpenDisplay(NULL);
         if (m_display) {
             m_rootWindow = DefaultRootWindow(m_display);
@@ -83,28 +88,35 @@ public:
     bool CaptureBGRA(std::vector<uint8_t>& bgraFrame) {
         bgraFrame.resize((size_t)m_width * m_height * 4);
         if (m_display && m_rootWindow) {
-            XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, m_width, m_height, AllPlanes, ZPixmap);
-            if (image) {
-                if (image->bits_per_pixel == 32) {
-                    for (int y = 0; y < m_height; ++y) {
-                        const uint8_t* srcLine = reinterpret_cast<const uint8_t*>(image->data) + y * image->bytes_per_line;
-                        uint8_t* dstLine = bgraFrame.data() + y * m_width * 4;
-                        memcpy(dstLine, srcLine, (size_t)m_width * 4);
-                    }
-                } else {
-                    for (int y = 0; y < m_height; ++y) {
-                        for (int x = 0; x < m_width; ++x) {
-                            unsigned long pixel = XGetPixel(image, x, y);
-                            size_t idx = (size_t)(y * m_width + x) * 4;
-                            bgraFrame[idx + 0] = (pixel) & 0xFF;
-                            bgraFrame[idx + 1] = (pixel >> 8) & 0xFF;
-                            bgraFrame[idx + 2] = (pixel >> 16) & 0xFF;
-                            bgraFrame[idx + 3] = 0xFF;
+            XWindowAttributes gattr{};
+            if (XGetWindowAttributes(m_display, m_rootWindow, &gattr) != 0) {
+                int capW = (m_width < gattr.width) ? m_width : gattr.width;
+                int capH = (m_height < gattr.height) ? m_height : gattr.height;
+                if (capW > 0 && capH > 0) {
+                    XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, capW, capH, AllPlanes, ZPixmap);
+                    if (image) {
+                        if (image->bits_per_pixel == 32) {
+                            for (int y = 0; y < capH && y < m_height; ++y) {
+                                const uint8_t* srcLine = reinterpret_cast<const uint8_t*>(image->data) + y * image->bytes_per_line;
+                                uint8_t* dstLine = bgraFrame.data() + y * m_width * 4;
+                                memcpy(dstLine, srcLine, (size_t)capW * 4);
+                            }
+                        } else {
+                            for (int y = 0; y < capH && y < m_height; ++y) {
+                                for (int x = 0; x < capW && x < m_width; ++x) {
+                                    unsigned long pixel = XGetPixel(image, x, y);
+                                    size_t idx = (size_t)(y * m_width + x) * 4;
+                                    bgraFrame[idx + 0] = (pixel) & 0xFF;
+                                    bgraFrame[idx + 1] = (pixel >> 8) & 0xFF;
+                                    bgraFrame[idx + 2] = (pixel >> 16) & 0xFF;
+                                    bgraFrame[idx + 3] = 0xFF;
+                                }
+                            }
                         }
+                        XDestroyImage(image);
+                        return true;
                     }
                 }
-                XDestroyImage(image);
-                return true;
             }
         }
 

@@ -181,11 +181,48 @@ static void RunAdbReverse(uint16_t port) {
         UsbLog("No se pudo lanzar adb.exe (err=%lu)", GetLastError());
     }
 #else
-    char fullCmd[256];
-    snprintf(fullCmd, sizeof(fullCmd), "%s >/dev/null 2>&1", cmd);
+    static std::string cachedAdbCmd;
+    static bool hasCached = false;
+
+    if (!hasCached) {
+        std::vector<std::string> candidates = {
+            "adb",
+            "flatpak-spawn --host adb",
+            "/usr/bin/adb",
+            "/usr/local/bin/adb",
+            "/var/usrlocal/bin/adb",
+            "/run/host/usr/bin/adb"
+        };
+        const char* home = getenv("HOME");
+        if (home && *home) {
+            candidates.push_back(std::string(home) + "/.local/bin/adb");
+            candidates.push_back(std::string(home) + "/.android-sdk/platform-tools/adb");
+            candidates.push_back(std::string(home) + "/Android/Sdk/platform-tools/adb");
+        }
+
+        for (const auto& candidate : candidates) {
+            char testCmd[512];
+            snprintf(testCmd, sizeof(testCmd), "%s reverse tcp:%u tcp:%u >/dev/null 2>&1", candidate.c_str(), port, port);
+            int res = system(testCmd);
+            if (res == 0) {
+                cachedAdbCmd = candidate;
+                hasCached = true;
+                UsbLog("%s reverse tcp:%u tcp:%u OK", candidate.c_str(), port, port);
+                return;
+            }
+        }
+        cachedAdbCmd = "adb";
+    }
+
+    char fullCmd[512];
+    snprintf(fullCmd, sizeof(fullCmd), "%s reverse tcp:%u tcp:%u >/dev/null 2>&1", cachedAdbCmd.c_str(), port, port);
     int res = system(fullCmd);
-    if (res == 0) UsbLog("adb reverse tcp:%u tcp:%u OK", port, port);
-    else UsbLog("adb reverse tcp:%u tcp:%u retorno %d", port, port, res);
+    if (res == 0) {
+        UsbLog("%s reverse tcp:%u tcp:%u OK", cachedAdbCmd.c_str(), port, port);
+    } else {
+        UsbLog("%s reverse tcp:%u tcp:%u retorno %d", cachedAdbCmd.c_str(), port, port, res);
+        hasCached = false;
+    }
 #endif
 }
 
