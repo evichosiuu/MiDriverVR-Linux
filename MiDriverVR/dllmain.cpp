@@ -30,6 +30,7 @@ static void LoadSecret(uint8_t out[16]) {
     memcpy(out, _a, 4); memcpy(out + 4, _b, 4); memcpy(out + 8, _c, 4); memcpy(out + 12, _d, 4);
 }
 
+#pragma pack(push, 1)
 struct HandData {
     float x, y, z, qx, qy, qz, qw, trigger, grip, joyX, joyY, sysBtn, appBtn, clickBtn, isTracked;
     float curlThumb, curlIndex, curlMiddle, curlRing, curlPinky;
@@ -38,7 +39,10 @@ struct HmdData { float x, y, z, qx, qy, qz, qw, isTracked; };
 #define PACKET_FLOATS 49
 #define PACKET_BYTES  (PACKET_FLOATS*4)
 struct TrackingPacket { float token; HandData left, right; HmdData hmd; };
-static_assert(sizeof(TrackingPacket) == PACKET_BYTES, "size mismatch");
+#pragma pack(pop)
+static_assert(sizeof(HandData) == 20 * sizeof(float), "HandData size mismatch");
+static_assert(sizeof(HmdData) == 8 * sizeof(float), "HmdData size mismatch");
+static_assert(sizeof(TrackingPacket) == PACKET_BYTES, "TrackingPacket size mismatch");
 
 struct ClientSession { bool active = false; uint32_t token = 0; sockaddr_in addr = {}; uint8_t challenge[8] = {}; ULONGLONG lastDataMs = 0; };
 static ClientSession g_kbdSession, g_phoneSession;
@@ -754,6 +758,7 @@ class CServerDriver : public IServerTrackedDeviceProvider {
     void ProcessData() {
         if (m_ds == INVALID_SOCKET) return;
         char buf[PACKET_BYTES + 16]; sockaddr_in from{}; socklen_t fl = sizeof(from); int n;
+        static uint32_t udpPktCount = 0;
         while ((fl = sizeof(from)), (n = recvfrom(m_ds, buf, sizeof(buf), 0, (sockaddr*)&from, &fl)) > 0) {
             if (n != PACKET_BYTES) continue;
             bool loop = IsLoopbackAddr(from);
@@ -762,6 +767,10 @@ class CServerDriver : public IServerTrackedDeviceProvider {
             if (from.sin_addr.s_addr != sess.addr.sin_addr.s_addr) continue;
             uint32_t rt; memcpy(&rt, buf, 4); if (rt != sess.token) continue;
             sess.lastDataMs = GetTickCount64();
+            udpPktCount++;
+            if ((udpPktCount % 300) == 1) {
+                DbgLog("[MiDriverVR] Recibido paquete UDP de tracking (#%u, %s)", udpPktCount, loop ? "loopback" : "phone");
+            }
             memcpy(loop ? &g_kbdPkt : &g_phonePkt, buf, PACKET_BYTES);
         }
     }
@@ -818,11 +827,19 @@ class CServerDriver : public IServerTrackedDeviceProvider {
 public:
     EVRInitError Init(IVRDriverContext* ctx) override {
         VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
+        DbgLog("[MiDriverVR] CServerDriver::Init starting...");
+        if (vr::VRDriverLog()) {
+            vr::VRDriverLog()->Log("[MiDriverVR] Initializing MiDriverVR Server Driver");
+        }
         g_kbdSession = {}; g_phoneSession = {}; g_kbdPkt = {}; g_phonePkt = {};
-        if (ResolveBaseCode() == 0u) return VRInitError_Driver_NotLoaded;
-        VRServerDriverHost()->TrackedDeviceAdded("CamHMD", TrackedDeviceClass_HMD, &g_hmd);
-        VRServerDriverHost()->TrackedDeviceAdded("CamCtrl_L", TrackedDeviceClass_Controller, &g_left);
-        VRServerDriverHost()->TrackedDeviceAdded("CamCtrl_R", TrackedDeviceClass_Controller, &g_right);
+        if (ResolveBaseCode() == 0u) {
+            DbgLog("[MiDriverVR] ResolveBaseCode validation failed");
+            return VRInitError_Driver_NotLoaded;
+        }
+        bool hmdAdded = VRServerDriverHost()->TrackedDeviceAdded("CamHMD", TrackedDeviceClass_HMD, &g_hmd);
+        bool leftAdded = VRServerDriverHost()->TrackedDeviceAdded("CamCtrl_L", TrackedDeviceClass_Controller, &g_left);
+        bool rightAdded = VRServerDriverHost()->TrackedDeviceAdded("CamCtrl_R", TrackedDeviceClass_Controller, &g_right);
+        DbgLog("[MiDriverVR] Devices added - HMD: %d, LeftCtrl: %d, RightCtrl: %d", hmdAdded, leftAdded, rightAdded);
 
 #ifdef _WIN32
         WSADATA wsa;
@@ -903,6 +920,7 @@ public:
     }
 
     void Cleanup() override {
+        DbgLog("[MiDriverVR] CServerDriver::Cleanup starting...");
         g_streamer.Stop(); StopAnnounce();
         StopHotkeyListener();
         StopKeyboardHotkey();
@@ -914,6 +932,7 @@ public:
 #ifdef _WIN32
         WSACleanup();
 #endif
+        DbgLog("[MiDriverVR] CServerDriver::Cleanup finished.");
     }
     const char* const* GetInterfaceVersions() override { return k_InterfaceVersions; }
     bool ShouldBlockStandbyMode() override { return false; }
@@ -924,7 +943,11 @@ static CServerDriver g_server;
 
 extern "C" DRIVER_EXPORT
 void* HmdDriverFactory(const char* iface, int* ret) {
-    if (strcmp(IServerTrackedDeviceProvider_Version, iface) == 0) return &g_server;
+    DbgLog("[MiDriverVR] HmdDriverFactory requested interface: %s", iface ? iface : "null");
+    if (iface && strcmp(IServerTrackedDeviceProvider_Version, iface) == 0) {
+        if (ret) *ret = VRInitError_None;
+        return &g_server;
+    }
     if (ret) *ret = VRInitError_Init_InterfaceNotFound;
     return nullptr;
 }

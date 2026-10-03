@@ -5,9 +5,10 @@ static void PrevLog(const char* fmt, ...) {
     char buf[256]; va_list va; va_start(va, fmt);
     vsnprintf(buf, sizeof(buf), fmt, va); va_end(va);
 #ifdef _WIN32
-    OutputDebugStringA("[CamVR][LowResPreview] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
+    OutputDebugStringA("[MiDriverVR][LowResPreview] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
 #else
-    fprintf(stderr, "[CamVR][LowResPreview] %s\n", buf);
+    fprintf(stderr, "[MiDriverVR][LowResPreview] %s\n", buf);
+    fflush(stderr);
 #endif
 }
 
@@ -124,9 +125,20 @@ static int PrevSilentX11ErrorHandler(Display*, XErrorEvent*) {
 
 bool VrLowResPreview::InitGdi() {
     XSetErrorHandler(PrevSilentX11ErrorHandler);
+    const char* dispEnv = getenv("DISPLAY");
+    if (!dispEnv || *dispEnv == '\0') {
+        PrevLog("Aviso: DISPLAY no definido (entorno Wayland/headless). Usando patron sintetico para preview.");
+        m_display = nullptr;
+        m_rootWindow = 0;
+        return true;
+    }
     m_display = XOpenDisplay(NULL);
     if (m_display) {
         m_rootWindow = DefaultRootWindow(m_display);
+        PrevLog("X11 Display abierto correctamente (%s) para preview.", dispEnv);
+    } else {
+        PrevLog("Aviso: XOpenDisplay fallo en %s. Usando patron sintetico para preview.", dispEnv);
+        m_rootWindow = 0;
     }
     return true;
 }
@@ -142,6 +154,8 @@ void VrLowResPreview::ResolveCaptureRegion() {}
 
 bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     outRgb565.resize((size_t)FRAME_W * FRAME_H);
+    bool captured = false;
+
     if (m_display && m_rootWindow) {
         XWindowAttributes gattr{};
         if (XGetWindowAttributes(m_display, m_rootWindow, &gattr) != 0) {
@@ -149,7 +163,7 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
             int capH = (FRAME_H < gattr.height) ? FRAME_H : gattr.height;
             if (capW > 0 && capH > 0) {
                 XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, capW, capH, AllPlanes, ZPixmap);
-                if (image) {
+                if (image && image->data) {
                     for (int y = 0; y < capH && y < FRAME_H; ++y) {
                         for (int x = 0; x < capW && x < FRAME_W; ++x) {
                             unsigned long pixel = XGetPixel(image, x, y);
@@ -161,15 +175,17 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
                         }
                     }
                     XDestroyImage(image);
-                    return true;
+                    captured = true;
                 }
             }
         }
     }
 
-    static uint8_t c = 0; c += 4;
-    for (int i = 0; i < FRAME_W * FRAME_H; ++i) {
-        outRgb565[i] = (uint16_t)(((c >> 3) << 11) | ((128 >> 2) << 5) | ((255 - c) >> 3));
+    if (!captured) {
+        static uint8_t c = 0; c += 4;
+        for (int i = 0; i < FRAME_W * FRAME_H; ++i) {
+            outRgb565[i] = (uint16_t)(((c >> 3) << 11) | ((128 >> 2) << 5) | ((255 - c) >> 3));
+        }
     }
     return true;
 }

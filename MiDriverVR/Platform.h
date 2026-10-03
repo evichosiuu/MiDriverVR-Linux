@@ -52,6 +52,16 @@
   typedef uint8_t BYTE;
   typedef int32_t LONG;
   typedef uint32_t ULONG;
+  typedef void* HANDLE;
+  typedef void* HWND;
+
+  union LARGE_INTEGER {
+      struct {
+          DWORD LowPart;
+          LONG HighPart;
+      } u;
+      int64_t QuadPart;
+  };
 
   inline int WSAGetLastError() { return errno; }
 
@@ -75,11 +85,12 @@ inline void DbgLog(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, va);
     va_end(va);
 #ifdef _WIN32
-    OutputDebugStringA("[CamVR] ");
+    OutputDebugStringA("[MiDriverVR] ");
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
 #else
-    fprintf(stderr, "[CamVR] %s\n", buf);
+    fprintf(stderr, "[MiDriverVR] %s\n", buf);
+    fflush(stderr);
 #endif
 }
 

@@ -4,9 +4,10 @@ static void UsbLog(const char* fmt, ...) {
     char buf[256]; va_list va; va_start(va, fmt);
     vsnprintf(buf, sizeof(buf), fmt, va); va_end(va);
 #ifdef _WIN32
-    OutputDebugStringA("[CamVR][USB] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
+    OutputDebugStringA("[MiDriverVR][USB] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
 #else
-    fprintf(stderr, "[CamVR][USB] %s\n", buf);
+    fprintf(stderr, "[MiDriverVR][USB] %s\n", buf);
+    fflush(stderr);
 #endif
 }
 
@@ -139,15 +140,21 @@ void UsbTrackingServer::ClientLoop(SOCKET client) {
 
     if (handshakeOk) {
         UsbLog("Handshake USB OK, token=0x%08X - streaming de tracking iniciado", token);
+        uint32_t pktCount = 0;
 
         while (m_running.load()) {
             if (!RecvFrame(client, frame)) break;
             if ((int)frame.size() == PACKET_BYTES) {
                 uint32_t rt; memcpy(&rt, frame.data(), 4);
                 if (rt != token) continue;
+                pktCount++;
+                if ((pktCount % 300) == 1) {
+                    UsbLog("Recibido paquete de tracking USB (#%u, %d bytes)", pktCount, (int)frame.size());
+                }
                 if (m_cb.onPacket) m_cb.onPacket(frame.data(), frame.size());
             }
             else if (frame.size() == 13 && memcmp(frame.data(), "QUAL", 4) == 0) {
+                UsbLog("Recibido paquete de calidad USB (13 bytes)");
                 if (m_cb.onQuality) m_cb.onQuality(frame.data());
             }
         }

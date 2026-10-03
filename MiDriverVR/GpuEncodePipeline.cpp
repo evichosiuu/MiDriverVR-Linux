@@ -12,7 +12,7 @@
 static void GpuLog(const char* fmt, ...) {
     char buf[320]; va_list va; va_start(va, fmt);
     vsnprintf(buf, sizeof(buf), fmt, va); va_end(va);
-    OutputDebugStringA("[CamVR][GPU] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
+    OutputDebugStringA("[MiDriverVR][GPU] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
 }
 
 std::vector<GpuAdapterInfo> GpuCapabilities::EnumerateAllAdapters() {
