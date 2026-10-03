@@ -1,6 +1,6 @@
 {
 	"locator": {
-		"drivername": "mi_driver_tutorial",
+		"drivername": "MiDriverVR",
 		"resourcepath": "resources"
 	}
 }

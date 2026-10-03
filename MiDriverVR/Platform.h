@@ -221,11 +221,14 @@ inline std::vector<sockaddr_in> GetSubnetBroadcastAddressesPort(uint16_t announc
             dest.sin_family = AF_INET;
             dest.sin_port = htons(announcePort);
 
-            if ((ifa->ifa_flags & IFF_BROADCAST) && ifa->ifa_broadaddr) {
+            if ((ifa->ifa_flags & IFF_BROADCAST) && ifa->ifa_broadaddr && ifa->ifa_broadaddr->sa_family == AF_INET) {
                 sockaddr_in* bsa = reinterpret_cast<sockaddr_in*>(ifa->ifa_broadaddr);
                 dest.sin_addr.s_addr = bsa->sin_addr.s_addr;
+            } else if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET) {
+                sockaddr_in* nmsa = reinterpret_cast<sockaddr_in*>(ifa->ifa_netmask);
+                dest.sin_addr.s_addr = sa->sin_addr.s_addr | ~(nmsa->sin_addr.s_addr);
             } else {
-                dest.sin_addr.s_addr = sa->sin_addr.s_addr | htonl(0x000000FF);
+                dest.sin_addr.s_addr = htonl(ntohl(sa->sin_addr.s_addr) | 0x000000FF);
             }
             result.push_back(dest);
         }
