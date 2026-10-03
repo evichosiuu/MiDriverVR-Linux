@@ -28,11 +28,24 @@ public:
     Window m_rootWindow = 0;
 
     bool Init(int w, int h, int fps, int bitrate, int gopSize) {
+        if (w <= 0 || h <= 0) {
+            DbgLog("[MiDriverVR] Dimensiones invalidas (%dx%d), usando 1280x720 por defecto", w, h);
+            w = 1280; h = 720;
+        }
+        if (w % 2 != 0) w &= ~1;
+        if (h % 2 != 0) h &= ~1;
+        if (fps <= 0) fps = 30;
+        if (bitrate <= 0) bitrate = 6000000;
+        if (gopSize <= 0) gopSize = fps;
+
         m_width = w; m_height = h; m_fps = fps; m_bitrate = bitrate; m_gopSize = gopSize;
+
+        DbgLog("[MiDriverVR] LinuxVideoEncoder Init: %dx%d @%dfps, bitrate=%d, GOP=%d",
+               m_width, m_height, m_fps, m_bitrate, m_gopSize);
 
         x264_param_t param;
         if (x264_param_default_preset(&param, "ultrafast", "zerolatency") < 0) {
-            DbgLog("x264_param_default_preset fallo");
+            DbgLog("[MiDriverVR] x264_param_default_preset fallo");
             return false;
         }
 
@@ -51,24 +64,31 @@ public:
         param.i_threads = 0;
 
         if (x264_picture_alloc(&m_picIn, X264_CSP_NV12, m_width, m_height) < 0) {
-            DbgLog("x264_picture_alloc fallo");
+            DbgLog("[MiDriverVR] x264_picture_alloc fallo");
             return false;
         }
 
         m_encoder = x264_encoder_open(&param);
         if (!m_encoder) {
-            DbgLog("x264_encoder_open fallo");
+            DbgLog("[MiDriverVR] x264_encoder_open fallo");
             x264_picture_clean(&m_picIn);
             return false;
         }
 
         XSetErrorHandler(SilentX11ErrorHandler);
-        m_display = XOpenDisplay(NULL);
-        if (m_display) {
-            m_rootWindow = DefaultRootWindow(m_display);
-            DbgLog("X11 Display abierto OK para captura video");
+        const char* dispEnv = getenv("DISPLAY");
+        if (dispEnv && *dispEnv != '\0') {
+            m_display = XOpenDisplay(NULL);
+            if (m_display) {
+                m_rootWindow = DefaultRootWindow(m_display);
+                DbgLog("[MiDriverVR] X11 Display (%s) abierto OK para captura video", dispEnv);
+            } else {
+                DbgLog("[MiDriverVR] Aviso: XOpenDisplay fallo en %s, usando patron de prueba para streaming", dispEnv);
+            }
         } else {
-            DbgLog("Aviso: X11 Display no disponible, usando patron de prueba para streaming");
+            DbgLog("[MiDriverVR] Aviso: DISPLAY no configurado (Wayland/headless), usando patron de prueba para streaming");
+            m_display = nullptr;
+            m_rootWindow = 0;
         }
         return true;
     }
@@ -87,6 +107,8 @@ public:
 
     bool CaptureBGRA(std::vector<uint8_t>& bgraFrame) {
         bgraFrame.resize((size_t)m_width * m_height * 4);
+        bool captured = false;
+
         if (m_display && m_rootWindow) {
             XWindowAttributes gattr{};
             if (XGetWindowAttributes(m_display, m_rootWindow, &gattr) != 0) {
@@ -94,7 +116,7 @@ public:
                 int capH = (m_height < gattr.height) ? m_height : gattr.height;
                 if (capW > 0 && capH > 0) {
                     XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, capW, capH, AllPlanes, ZPixmap);
-                    if (image) {
+                    if (image && image->data) {
                         if (image->bits_per_pixel == 32) {
                             for (int y = 0; y < capH && y < m_height; ++y) {
                                 const uint8_t* srcLine = reinterpret_cast<const uint8_t*>(image->data) + y * image->bytes_per_line;
@@ -114,26 +136,32 @@ public:
                             }
                         }
                         XDestroyImage(image);
-                        return true;
+                        captured = true;
                     }
                 }
             }
         }
 
-        static uint8_t color = 0;
-        color += 2;
-        for (size_t i = 0; i < bgraFrame.size(); i += 4) {
-            bgraFrame[i + 0] = color;
-            bgraFrame[i + 1] = 128;
-            bgraFrame[i + 2] = 255 - color;
-            bgraFrame[i + 3] = 255;
+        if (!captured) {
+            static uint8_t color = 0;
+            color += 2;
+            for (size_t i = 0; i < bgraFrame.size(); i += 4) {
+                bgraFrame[i + 0] = color;
+                bgraFrame[i + 1] = 128;
+                bgraFrame[i + 2] = 255 - color;
+                bgraFrame[i + 3] = 255;
+            }
         }
         return true;
     }
 
     bool Encode(const uint8_t* bgra, std::vector<std::vector<uint8_t>>& nalUnits, bool forceIDR) {
+        if (!bgra || !m_encoder) return false;
+
         uint8_t* pY = m_picIn.img.plane[0];
         uint8_t* pUV = m_picIn.img.plane[1];
+        if (!pY || !pUV) return false;
+
         int strideY = m_picIn.img.i_stride[0];
         int strideUV = m_picIn.img.i_stride[1];
 
@@ -163,14 +191,19 @@ public:
         x264_nal_t* nals = nullptr;
         int iNal = 0;
         int frameSize = x264_encoder_encode(m_encoder, &nals, &iNal, &m_picIn, &m_picOut);
-        if (frameSize < 0) return false;
+        if (frameSize < 0) {
+            DbgLog("[MiDriverVR] x264_encoder_encode fallo (%d)", frameSize);
+            return false;
+        }
 
         nalUnits.clear();
         for (int i = 0; i < iNal; ++i) {
-            std::vector<uint8_t> nalData(nals[i].p_payload, nals[i].p_payload + nals[i].i_payload);
-            nalUnits.push_back(std::move(nalData));
+            if (nals[i].p_payload && nals[i].i_payload > 0) {
+                std::vector<uint8_t> nalData(nals[i].p_payload, nals[i].p_payload + nals[i].i_payload);
+                nalUnits.push_back(std::move(nalData));
+            }
         }
-        return true;
+        return !nalUnits.empty();
     }
 };
 
