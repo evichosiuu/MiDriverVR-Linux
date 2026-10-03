@@ -6,95 +6,66 @@
 
 ## 🇪🇸 Español
 
-### Requisitos para compilar
+### Requisitos para compilar en Linux
+
+#### 1. Paquetes y dependencias
+Instala los compiladores C++17 y librerías necesarias (OpenSSL, x264, X11, PulseAudio):
+```bash
+sudo apt-get install -y build-essential cmake libssl-dev libx264-dev libx11-dev libpulse-dev
+```
+
+#### 2. Compilación en Linux
+
+Puedes compilar con `make` o con `cmake`:
+
+**Usando Make:**
+```bash
+make
+```
+
+**Usando CMake:**
+```bash
+mkdir -p build && cd build
+cmake ..
+make
+```
+
+El resultado `driver_MiDriverVR.so` se guardará automáticamente en `bin/linux64/driver_MiDriverVR.so`.
+
+---
+
+### Requisitos para compilar en Windows
 
 #### 1. Visual Studio
-
-- **Visual Studio 2022** (Community es gratis y suficiente) — la versión más reciente está bien, no hace falta una "especial".
-- Al instalar, selecciona el workload **"Desarrollo para el escritorio con C++"** (*Desktop development with C++*). Esto te da el compilador MSVC, el linker y las herramientas de depuración.
-- Asegúrate de incluir el **Windows 10/11 SDK** más reciente (se instala junto con el workload de C++, pero revisa que esté marcado en el instalador — headers como `wincrypt.h`, `mfapi.h`, `audioclient.h`, `iphlpapi.h`, etc. vienen de ahí).
+- **Visual Studio 2022** con el workload **"Desarrollo para el escritorio con C++"**.
+- Windows 10/11 SDK.
 
 #### 2. OpenVR SDK
+El proyecto requiere `openvr_driver.h` de Valve (incluido en `headers/`).
 
-El proyecto incluye `#include <openvr_driver.h>`, que **no viene con Visual Studio**. Necesitas descargar el SDK de OpenVR de Valve:
-
-- Repositorio: [`github.com/ValveSoftware/openvr`](https://github.com/ValveSoftware/openvr)
-- Necesitas la carpeta `headers/` (con `openvr_driver.h`) y el `.lib` correspondiente si tu build lo requiere (normalmente los drivers de SteamVR solo necesitan los headers, ya que se cargan dinámicamente vía `HmdDriverFactory`).
-- Agrega esa ruta en **Project Properties → C/C++ → General → Additional Include Directories**.
-
-#### 3. Configuración del proyecto
-
-- **Plataforma:** x64 (SteamVR/OpenVR requiere 64 bits).
-- **Tipo de proyecto:** DLL (`.dll`), ya que exporta `HmdDriverFactory` con `__declspec(dllexport)`.
-- Las librerías ya están enlazadas vía `#pragma comment(lib, ...)` en el propio código (`ws2_32.lib`, `crypt32.lib`, `mfplat.lib`, `mfuuid.lib`, `mf.lib`, `gdi32.lib`, `user32.lib`, `winmm.lib`, `avrt.lib`, `iphlpapi.lib`), así que no necesitas agregarlas manualmente al linker — solo que el SDK de Windows esté instalado.
+#### 3. Compilar en Windows
+- Abre `MiDriverVR.sln` en Visual Studio.
+- Selecciona la plataforma **x64**.
+- Compila con `Ctrl + Shift + B`. El `.dll` se generará en `bin/win64/driver_MiDriverVR.dll`.
 
 ---
 
-### Configuración paso a paso en Visual Studio (rutas exactas)
+### Instalación en SteamVR (Linux / Windows)
 
-#### 1. Descargar y ubicar el SDK
-
-Descarga **OpenVR SDK v2.12.14** y descomprímelo en una ruta como:
+La estructura final dentro de la carpeta de drivers de SteamVR (`~/.steam/steam/steamapps/common/SteamVR/drivers/MiDriverVR` en Linux o `SteamVR\drivers\MiDriverVR` en Windows) debe verse así:
 
 ```
-C:\Users\<tu_usuario>\tudireciondelarchivo\openvr-2.12.14\
-```
-
-Deberías tener dentro las carpetas `headers`, `lib`, `bin`, `src`, etc.
-
-#### 2. Directorios de inclusión (Include)
-
-**Propiedades del proyecto → C/C++ → General → Directorios de inclusión adicionales**
-
-```
-C:\Users\<tu_usuario>\tudireciondelarchivo\openvr-2.12.14\headers;%(AdditionalIncludeDirectories)
-```
-
-#### 3. Directorios de bibliotecas (Library)
-
-**Propiedades del proyecto → Vinculador → General → Directorios de bibliotecas adicionales**
-
-```
-C:\Users\<tu_usuario>\tudireciondelarchivo\openvr-2.12.14\lib\win64;%(AdditionalLibraryDirectories)
-```
-
-> En ambos casos, deja la **Configuración** en "Todas las config." y la **Plataforma** en "Todas las plataformas" para que aplique a Debug y Release por igual.
-
-#### 4. Propiedades generales
-
-| Propiedad | Valor |
-|---|---|
-| Directorio de salida | `C:\Program Files (x86)\Steam\steamapps\common\SteamVR\drivers\MiDriverVR\bin\win64\` |
-| Nombre de destino | `driver_MiDriverVR` |
-| Tipo de configuración | Biblioteca dinámica (.dll) |
-| Versión del SDK de Windows | 10.0 (última versión instalada) |
-| Conjunto de herramientas de la plataforma | Visual Studio 2022 (v143) |
-| Estándar de lenguaje C++ | Estándar ISO C++17 (`/std:c++17`) |
-
-> El **Directorio de salida** apunta directo a la carpeta de drivers de SteamVR, así el `.dll` compilado queda listo sin copiarlo manualmente.
-
-#### 5. Compilar
-
-- Selecciona plataforma **x64** (obligatorio).
-- Compila con `Ctrl + Shift + B` o **Compilar → Compilar solución**.
-- El resultado `driver_MiDriverVR.dll` aparecerá automáticamente en la carpeta de drivers de SteamVR.
-
----
-
-### Instalación en SteamVR
-
-La estructura final dentro de `SteamVR\drivers\` debe verse así:
-
-```
-SteamVR\drivers\MiDriverVR
-├── bin\win64\driver_MiDriverVR.dll
-├── resources
+SteamVR/drivers/MiDriverVR
+├── bin/
+│   ├── win64/driver_MiDriverVR.dll
+│   └── linux64/driver_MiDriverVR.so
+├── resources/
 ├── driver.vrdesc
 └── driver.vrdrivermanifest
 ```
 
-1. Copia (o verifica, según tu directorio de salida) los archivos `driver.vrdesc`, `driver.vrdrivermanifest` y la carpeta `resources` dentro de `SteamVR\drivers\MiDriverVR\`.
-2. Abre SteamVR — el driver se carga automáticamente si el manifiesto está bien registrado.
+1. Copia la carpeta `MiDriverVR` con los binarios `bin/`, `driver.vrdesc`, `driver.vrdrivermanifest` y la carpeta `resources/` a la ruta de drivers de SteamVR.
+2. Abre SteamVR — el driver se cargará automáticamente.
 3. Revisa `vrserver.txt` para confirmar que aparecen líneas con el prefijo `[CamVR]` sin errores.
 
 ---
@@ -108,14 +79,15 @@ SteamVR\drivers\MiDriverVR
 | Cambio de calidad de video | 47296 | UDP |
 | Flip de HMD (comando remoto) | 47297 | UDP |
 | Streaming de audio | 47298 | TCP |
+| USB Tracking & LowRes Preview | 47299 | TCP / UDP |
 
 ---
-recuerda de modificar el vrsetings para tambien activar el driver C:\Program Files (x86)\Steam\config\
 
 ### Notas técnicas
 
-- El encoder de video intenta usar **hardware (Media Foundation MFT)** primero; si no genera NALs en ~1.2s, cae automáticamente a **software**.
-- La captura detecta monitores virtuales automáticamente (no primarios) para evitar capturar el escritorio real.
+- Soporta conexión inalámbrica (**WiFi**) y por cable **USB** (vía túneles `adb reverse`).
+- En Linux, la captura de pantalla utiliza X11 y la codificación H.264 de baja latencia utiliza `libx264`. La captura de audio utiliza la API simple de PulseAudio.
+- En Windows, utiliza Media Foundation MFT / Direct3D11 para codificación por hardware con fallback a software, y WASAPI para audio loopback.
 - La autenticación de sesión usa reto-respuesta con **HMAC-SHA256** truncado a 8 bytes, separando sesiones por loopback (PC) vs red (teléfono).
 - El suavizado de posición y curl de dedos usa un filtro exponencial simple para evitar saltos bruscos.
 
@@ -125,96 +97,67 @@ recuerda de modificar el vrsetings para tambien activar el driver C:\Program Fil
 
 ## 🇬🇧 English
 
-### Build requirements
+### Build requirements for Linux
+
+#### 1. Packages and dependencies
+Install the required C++17 compiler and libraries (OpenSSL, x264, X11, PulseAudio):
+```bash
+sudo apt-get install -y build-essential cmake libssl-dev libx264-dev libx11-dev libpulse-dev
+```
+
+#### 2. Building on Linux
+
+You can compile using either `make` or `cmake`:
+
+**Using Make:**
+```bash
+make
+```
+
+**Using CMake:**
+```bash
+mkdir -p build && cd build
+cmake ..
+make
+```
+
+The compiled library `driver_MiDriverVR.so` will be created automatically in `bin/linux64/driver_MiDriverVR.so`.
+
+---
+
+### Build requirements for Windows
 
 #### 1. Visual Studio
-
-- **Visual Studio 2022** (Community is free and enough) — the latest version is fine, no "special" build needed.
-- During install, select the **"Desktop development with C++"** workload. This gives you the MSVC compiler, the linker, and the debugging tools.
-- Make sure the latest **Windows 10/11 SDK** is included (it installs alongside the C++ workload, but double-check it's checked in the installer — headers like `wincrypt.h`, `mfapi.h`, `audioclient.h`, `iphlpapi.h`, etc. come from there).
+- **Visual Studio 2022** with **"Desktop development with C++"** workload.
+- Windows 10/11 SDK.
 
 #### 2. OpenVR SDK
+Requires Valve's `openvr_driver.h` (included in `headers/`).
 
-The project includes `#include <openvr_driver.h>`, which **does not ship with Visual Studio**. You need to download Valve's OpenVR SDK:
-
-- Repository: [`github.com/ValveSoftware/openvr`](https://github.com/ValveSoftware/openvr)
-- You need the `headers/` folder (with `openvr_driver.h`) and the matching `.lib` if your build requires it (normally SteamVR drivers only need the headers, since they're loaded dynamically via `HmdDriverFactory`).
-- Add that path under **Project Properties → C/C++ → General → Additional Include Directories**.
-
-#### 3. Project configuration
-
-- **Platform:** x64 (SteamVR/OpenVR requires 64-bit).
-- **Project type:** DLL (`.dll`), since it exports `HmdDriverFactory` with `__declspec(dllexport)`.
-- The libraries are already linked via `#pragma comment(lib, ...)` in the code itself (`ws2_32.lib`, `crypt32.lib`, `mfplat.lib`, `mfuuid.lib`, `mf.lib`, `gdi32.lib`, `user32.lib`, `winmm.lib`, `avrt.lib`, `iphlpapi.lib`), so you don't need to add them manually to the linker — just make sure the Windows SDK is installed.
+#### 3. Building on Windows
+- Open `MiDriverVR.sln` in Visual Studio.
+- Select platform **x64**.
+- Build with `Ctrl + Shift + B`. The `.dll` will be generated in `bin/win64/driver_MiDriverVR.dll`.
 
 ---
 
-### Step-by-step setup in Visual Studio (exact paths)
+### Installing in SteamVR (Linux / Windows)
 
-#### 1. Download and place the SDK
-
-Download **OpenVR SDK v2.12.14** and unzip it to a path like:
+The final directory structure in SteamVR drivers directory (`~/.steam/steam/steamapps/common/SteamVR/drivers/MiDriverVR` on Linux or `SteamVR\drivers\MiDriverVR` on Windows) should look like this:
 
 ```
-C:\Users\<your_user>\path\to\file\openvr-2.12.14\
-```
-
-Inside you should have the `headers`, `lib`, `bin`, `src` folders, etc.
-
-#### 2. Include directories
-
-**Project Properties → C/C++ → General → Additional Include Directories**
-
-```
-C:\Users\<your_user>\path\to\file\openvr-2.12.14\headers;%(AdditionalIncludeDirectories)
-```
-
-#### 3. Library directories
-
-**Project Properties → Linker → General → Additional Library Directories**
-
-```
-C:\Users\<your_user>\path\to\file\openvr-2.12.14\lib\win64;%(AdditionalLibraryDirectories)
-```
-
-> In both cases, leave **Configuration** set to "All Configurations" and **Platform** set to "All Platforms" so it applies to Debug and Release alike.
-
-#### 4. General properties
-
-| Property | Value |
-|---|---|
-| Output Directory | `C:\Program Files (x86)\Steam\steamapps\common\SteamVR\drivers\MiDriverVR\bin\win64\` |
-| Target Name | `driver_MiDriverVR` |
-| Configuration Type | Dynamic Library (.dll) |
-| Windows SDK Version | 10.0 (latest installed) |
-| Platform Toolset | Visual Studio 2022 (v143) |
-| C++ Language Standard | ISO C++17 Standard (`/std:c++17`) |
-
-> The **Output Directory** points directly at the SteamVR drivers folder, so the compiled `.dll` ends up ready without manually copying it.
-
-#### 5. Build
-
-- Select the **x64** platform (required).
-- Build with `Ctrl + Shift + B` or **Build → Build Solution**.
-- The resulting `driver_MiDriverVR.dll` will automatically appear in the SteamVR drivers folder.
-
----
-
-### Installing in SteamVR
-
-The final structure inside `SteamVR\drivers\` should look like this:
-
-```
-SteamVR\drivers\MiDriverVR
-├── bin\win64\driver_MiDriverVR.dll
-├── resources
+SteamVR/drivers/MiDriverVR
+├── bin/
+│   ├── win64/driver_MiDriverVR.dll
+│   └── linux64/driver_MiDriverVR.so
+├── resources/
 ├── driver.vrdesc
 └── driver.vrdrivermanifest
 ```
 
-1. Copy (or verify, depending on your output directory) the `driver.vrdesc`, `driver.vrdrivermanifest` files and the `resources` folder into `SteamVR\drivers\MiDriverVR\`.
-2. Open SteamVR — the driver loads automatically if the manifest is registered correctly.
-3. Check `vrserver.txt` to confirm lines with the `[CamVR]` prefix appear without errors.
+1. Copy the `MiDriverVR` folder containing `bin/`, `driver.vrdesc`, `driver.vrdrivermanifest`, and `resources/` into the SteamVR drivers folder.
+2. Launch SteamVR — the driver will load automatically.
+3. Check `vrserver.txt` to confirm log lines with `[CamVR]` prefix appear without errors.
 
 ---
 
@@ -227,16 +170,16 @@ SteamVR\drivers\MiDriverVR
 | Video quality change | 47296 | UDP |
 | HMD flip (remote command) | 47297 | UDP |
 | Audio streaming | 47298 | TCP |
+| USB Tracking & LowRes Preview | 47299 | TCP / UDP |
 
 ---
 
-Remember to modify the VR settings to also activate the driver at C:\Program Files (x86)\Steam\config\.
-
 ### Technical notes
 
-- The video encoder first tries to use **hardware (Media Foundation MFT)**; if it doesn't produce NALs within ~1.2s, it automatically falls back to **software**.
-- Capture automatically detects virtual (non-primary) monitors to avoid capturing the real desktop.
-- Session authentication uses a challenge-response scheme with **HMAC-SHA256** truncated to 8 bytes, keeping loopback (PC) and network (phone) sessions separate.
-- Position smoothing and finger curl use a simple exponential filter to avoid abrupt jumps.
+- Supports both wireless (**WiFi**) and wired **USB** connections (via `adb reverse` tunnels).
+- On Linux, screen capture uses X11 and low-latency H.264 video encoding uses `libx264`. Audio capture uses PulseAudio simple API.
+- On Windows, video encoding uses Media Foundation MFT / Direct3D11 with software fallback, and audio loopback uses WASAPI.
+- Session authentication uses challenge-response with **HMAC-SHA256** truncated to 8 bytes, separating loopback (PC) and network (phone) sessions.
+- Position smoothing and finger curl use a simple exponential filter to prevent abrupt motion jumps.
 
 [⬆ Back to top](#midrivervr)

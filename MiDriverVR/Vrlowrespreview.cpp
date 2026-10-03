@@ -1,16 +1,17 @@
-#include "VrLowResPreview.h"
-#include <cstdio>
-#include <cstdarg>
+#include "Vrlowrespreview.h"
 #include <algorithm>
-
-#pragma comment(lib, "ws2_32.lib")
 
 static void PrevLog(const char* fmt, ...) {
     char buf[256]; va_list va; va_start(va, fmt);
     vsnprintf(buf, sizeof(buf), fmt, va); va_end(va);
+#ifdef _WIN32
     OutputDebugStringA("[CamVR][LowResPreview] "); OutputDebugStringA(buf); OutputDebugStringA("\n");
+#else
+    fprintf(stderr, "[CamVR][LowResPreview] %s\n", buf);
+#endif
 }
 
+#ifdef _WIN32
 static const uint32_t kAnnouncedWindowW = 1920;
 static const uint32_t kAnnouncedWindowH = 1080;
 
@@ -30,8 +31,6 @@ void VrLowResPreview::ResolveCaptureRegion() {
     EnumDisplayMonitors(nullptr, nullptr, LowResMonitorEnumProc, reinterpret_cast<LPARAM>(&monitors));
 
     const MonitorRectInfo* chosen = nullptr;
-
-
     for (auto& m : monitors) {
         LONG w = m.rc.right - m.rc.left, h = m.rc.bottom - m.rc.top;
         if ((UINT32)w == kAnnouncedWindowW && (UINT32)h == kAnnouncedWindowH && !m.isPrimary) {
@@ -48,45 +47,33 @@ void VrLowResPreview::ResolveCaptureRegion() {
         m_captureY = chosen->rc.top;
         m_captureW = chosen->rc.right - chosen->rc.left;
         m_captureH = chosen->rc.bottom - chosen->rc.top;
-        PrevLog("ResolveCaptureRegion: monitor VIRTUAL en (%d,%d) %dx%d",
-            m_captureX, m_captureY, m_captureW, m_captureH);
-    }
-    else {
-        // Fallback: monitor primario completo.
+    } else {
         m_captureX = 0; m_captureY = 0;
         m_captureW = GetSystemMetrics(SM_CXSCREEN);
         m_captureH = GetSystemMetrics(SM_CYSCREEN);
-        PrevLog("ResolveCaptureRegion: sin monitor separado, usando primario %dx%d (puede salir negro si SteamVR dibuja en otro monitor)",
-            m_captureW, m_captureH);
     }
 }
 
-
 bool VrLowResPreview::InitGdi() {
     m_screenDC = GetDC(nullptr);
-    if (!m_screenDC) { PrevLog("GetDC(nullptr) fallo err=%u", (unsigned)GetLastError()); return false; }
-
+    if (!m_screenDC) return false;
     ResolveCaptureRegion();
-
     m_memDC = CreateCompatibleDC(m_screenDC);
-    if (!m_memDC) { PrevLog("CreateCompatibleDC fallo err=%u", (unsigned)GetLastError()); return false; }
+    if (!m_memDC) return false;
 
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = FRAME_W;
-    bi.bmiHeader.biHeight = -FRAME_H; // top-down
+    bi.bmiHeader.biHeight = -FRAME_H;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
 
     void* bits = nullptr;
     m_memBmp = CreateDIBSection(m_memDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!m_memBmp) { PrevLog("CreateDIBSection fallo err=%u", (unsigned)GetLastError()); return false; }
+    if (!m_memBmp) return false;
 
     m_oldBmp = (HBITMAP)SelectObject(m_memDC, m_memBmp);
-
-    PrevLog("GDI init OK: captura (%d,%d) %dx%d -> preview %dx%d",
-        m_captureX, m_captureY, m_captureW, m_captureH, FRAME_W, FRAME_H);
     return true;
 }
 
@@ -97,7 +84,6 @@ void VrLowResPreview::CleanupGdi() {
     if (m_screenDC) { ReleaseDC(nullptr, m_screenDC); m_screenDC = nullptr; }
 }
 
-
 bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     SetStretchBltMode(m_memDC, HALFTONE);
     SetBrushOrgEx(m_memDC, 0, 0, nullptr);
@@ -107,7 +93,7 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
         m_screenDC, m_captureX, m_captureY, m_captureW, m_captureH,
         SRCCOPY | CAPTUREBLT
     );
-    if (!ok) { PrevLog("StretchBlt fallo err=%u", (unsigned)GetLastError()); return false; }
+    if (!ok) return false;
 
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -119,10 +105,7 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
 
     std::vector<uint8_t> bgra((size_t)FRAME_W * FRAME_H * 4);
     int lines = GetDIBits(m_screenDC, m_memBmp, 0, FRAME_H, bgra.data(), &bi, DIB_RGB_COLORS);
-    if (lines != FRAME_H) {
-        PrevLog("GetDIBits: lines=%d esperado=%d err=%u", lines, FRAME_H, (unsigned)GetLastError());
-        return false;
-    }
+    if (lines != FRAME_H) return false;
 
     outRgb565.resize((size_t)FRAME_W * FRAME_H);
     for (int i = 0; i < FRAME_W * FRAME_H; ++i) {
@@ -134,29 +117,71 @@ bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
     }
     return true;
 }
+#else
+bool VrLowResPreview::InitGdi() {
+    m_display = XOpenDisplay(NULL);
+    if (m_display) {
+        m_rootWindow = DefaultRootWindow(m_display);
+    }
+    return true;
+}
 
+void VrLowResPreview::CleanupGdi() {
+    if (m_display) {
+        XCloseDisplay(m_display);
+        m_display = nullptr;
+    }
+}
+
+void VrLowResPreview::ResolveCaptureRegion() {}
+
+bool VrLowResPreview::CaptureAndConvert(std::vector<uint16_t>& outRgb565) {
+    outRgb565.resize((size_t)FRAME_W * FRAME_H);
+    if (m_display && m_rootWindow) {
+        XImage* image = XGetImage(m_display, m_rootWindow, 0, 0, FRAME_W, FRAME_H, AllPlanes, ZPixmap);
+        if (image) {
+            for (int y = 0; y < FRAME_H; ++y) {
+                for (int x = 0; x < FRAME_W; ++x) {
+                    unsigned long pixel = XGetPixel(image, x, y);
+                    uint8_t b = pixel & 0xFF;
+                    uint8_t g = (pixel >> 8) & 0xFF;
+                    uint8_t r = (pixel >> 16) & 0xFF;
+                    uint16_t px = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                    outRgb565[y * FRAME_W + x] = px;
+                }
+            }
+            XDestroyImage(image);
+            return true;
+        }
+    }
+
+    static uint8_t c = 0; c += 4;
+    for (int i = 0; i < FRAME_W * FRAME_H; ++i) {
+        outRgb565[i] = (uint16_t)(((c >> 3) << 11) | ((128 >> 2) << 5) | ((255 - c) >> 3));
+    }
+    return true;
+}
+#endif
 
 bool VrLowResPreview::InitNetwork() {
     m_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_sock == INVALID_SOCKET) { PrevLog("socket() fallo err=%d", WSAGetLastError()); return false; }
+    if (m_sock == INVALID_SOCKET) return false;
 
+    SetSocketReuseAddr(m_sock);
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(PORT); a.sin_addr.s_addr = INADDR_ANY;
     if (bind(m_sock, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-        PrevLog("bind fallo err=%d", WSAGetLastError());
         closesocket(m_sock); m_sock = INVALID_SOCKET;
         return false;
     }
 
-    DWORD to = 500; setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof(to));
-
-    int sndbuf = 256 * 1024; setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
+    SetSocketRecvTimeout(m_sock, 500);
+    SetSocketSendBuffer(m_sock, 256 * 1024);
     return true;
 }
 
 void VrLowResPreview::CleanupNetwork() {
     if (m_sock != INVALID_SOCKET) { closesocket(m_sock); m_sock = INVALID_SOCKET; }
 }
-
 
 void VrLowResPreview::PruneSubscribers() {
     ULONGLONG now = GetTickCount64();
@@ -170,9 +195,10 @@ void VrLowResPreview::PruneSubscribers() {
 void VrLowResPreview::ListenLoop() {
     uint8_t buf[16];
     while (m_running.load()) {
-        sockaddr_in from{}; int fl = sizeof(from);
+        sockaddr_in from{};
+        socklen_t fl = sizeof(from);
         int n = recvfrom(m_sock, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
-        if (n <= 0) continue; // timeout normal (500ms) o error -> reintenta
+        if (n <= 0) continue;
 
         if (n == 8 && memcmp(buf, "VIDSUB\0\0", 8) == 0) {
             ULONGLONG now = GetTickCount64();
@@ -186,13 +212,13 @@ void VrLowResPreview::ListenLoop() {
             if (!found) {
                 Subscriber s; s.addr = from; s.lastSeenMs = now;
                 m_subscribers.push_back(s);
-                char ipStr[32]; inet_ntop(AF_INET, &from.sin_addr, ipStr, sizeof(ipStr));
+                char ipStr[32];
+                inet_ntop(AF_INET, &from.sin_addr, ipStr, sizeof(ipStr));
                 PrevLog("Nuevo suscriptor de preview: %s:%u", ipStr, ntohs(from.sin_port));
             }
         }
     }
 }
-
 
 void VrLowResPreview::SendFrameToSubscribers(const uint16_t* rgb565, uint32_t frameId) {
     std::vector<Subscriber> subsCopy;
@@ -203,7 +229,7 @@ void VrLowResPreview::SendFrameToSubscribers(const uint16_t* rgb565, uint32_t fr
     if (subsCopy.empty()) return;
 
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(rgb565);
-    const int totalBytes = FRAME_W * FRAME_H * 2; // RGB565 = 2 bytes/pixel
+    const int totalBytes = FRAME_W * FRAME_H * 2;
     const int totalChunks = (totalBytes + CHUNK_MAX - 1) / CHUNK_MAX;
 
     std::vector<uint8_t> pkt(HDR_BYTES + CHUNK_MAX);
@@ -226,19 +252,14 @@ void VrLowResPreview::SendFrameToSubscribers(const uint16_t* rgb565, uint32_t fr
     }
 }
 
-
 void VrLowResPreview::CaptureLoop() {
-    if (!InitGdi()) {
-        PrevLog("InitGdi fallo - preview no disponible (el resto del driver sigue funcionando igual)");
-        return;
-    }
+    if (!InitGdi()) return;
 
     uint32_t frameId = 0;
     std::vector<uint16_t> frame;
 
     while (m_running.load()) {
         ULONGLONG t0 = GetTickCount64();
-
         PruneSubscribers();
 
         bool hasSubs;
@@ -262,7 +283,6 @@ void VrLowResPreview::CaptureLoop() {
     CleanupGdi();
 }
 
-
 bool VrLowResPreview::Start() {
     if (m_running.exchange(true)) return true;
     if (!InitNetwork()) { m_running = false; return false; }
@@ -277,7 +297,7 @@ bool VrLowResPreview::Start() {
 
 void VrLowResPreview::Stop() {
     if (!m_running.exchange(false)) return;
-    CleanupNetwork(); // desbloquea recvfrom() en ListenLoop
+    CleanupNetwork();
     if (m_listenThread.joinable())  m_listenThread.join();
     if (m_captureThread.joinable()) m_captureThread.join();
 }
